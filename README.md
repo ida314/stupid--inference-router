@@ -1,13 +1,12 @@
 # Stupid Inference Router (`sir`)
 
-> A model-aware local inference scheduler that presents one API endpoint while dynamically
+> A model-aware local inference scheduler for my homelab that presents one API endpoint while dynamically
 > allocating a memory-constrained GPU between multiple LLM workloads.
 
 ## Motivation
 
-I have one DGX Spark and several homelab services that all want LLM inference — a general chat
-model, translation models, an embedding model, a coding model. The box has plenty of compute, but
-not enough memory to keep everything resident at once.
+I have one DGX Spark and several homelab services that all want LLM inference. Things like a general chat
+model, translation models, an embedding model, a coding model. The box has plenty of compute, but not enough memory to keep everything resident at once.
 
 The naive fix is to run a vLLM server per model. That breaks down quickly:
 
@@ -17,9 +16,7 @@ The naive fix is to run a vLLM server per model. That breaks down quickly:
 - A low-traffic model can sit blocked forever behind a busy one.
 - Services have to know whether their model is currently loaded.
 
-The real problem isn't serving inference — vLLM already does that well. It's deciding **which model
-gets to be resident right now**, given asynchronous requests from independent clients. That decision
-needs a single owner.
+The real problem isn't serving inference — vLLM already does that well. It's deciding **which model gets to be resident right now**, given asynchronous requests from independent clients. That decision needs a single owner.
 
 `sir` is that owner: one endpoint in front, one scheduler deciding model residency behind it.
 
@@ -27,33 +24,25 @@ needs a single owner.
 
 - Exposes a single OpenAI-compatible endpoint that every internal service talks to.
 - Accepts requests for any configured model, whether or not that model is currently loaded.
-- Queues requests per model, and schedules at the *model* level before the *request* level.
+- Queues requests per model, and schedules at the model level before the request level.
 - Loads, drains, and unloads inference backends on demand.
 - Batches work into model-serving windows so it doesn't thrash between models.
 - Guarantees no model waits indefinitely.
 
-Optimization target is **not** raw throughput. It's minimizing user-visible latency while avoiding
-unnecessary model swaps and keeping worst-case wait time bounded.
+Optimization target is not raw throughput. It's minimizing user-visible latency while avoiding unnecessary model swaps and keeping worst-case wait time bounded.
 
 ## The core tension
 
 Everything interesting in this project lives in one trade-off:
+Serving the resident model is free. Serving anything else costs a model swap.
 
-**Serving the resident model is free. Serving anything else costs a model swap.**
+Lean too far toward the resident model and low-traffic models starve. Lean too far the other way and the GPU spends its life loading weights instead of generating tokens. The scheduler's whole job is sitting in the middle of that, and the design choices follow from it:
 
-Lean too far toward the resident model and low-traffic models starve. Lean too far the other way and
-the GPU spends its life loading weights instead of generating tokens. The scheduler's whole job is
-sitting in the middle of that, and the design choices follow from it:
-
-- **Score models, not requests.** Each model with pending work gets a score from queue age, queue
-  depth, and priority, minus the cost of switching to it. Highest score wins the GPU.
-- **Hysteresis.** A freshly loaded model stays resident for a minimum period, so alternating
+- Score models, not requests. Each model with pending work gets a score from queue age, queue depth, and priority, minus the cost of switching to it. Highest score wins the GPU.
+- Hysteresis. A freshly loaded model stays resident for a minimum period, so alternating
   `A B A B` traffic doesn't produce four swaps.
-- **A hard starvation ceiling.** Past a fixed maximum wait, a model becomes mandatory regardless of
-  score. Fairness is a correctness property, not a tuning parameter — this is the backstop for when
-  I get the weights wrong.
-- **Drain before switch.** In-flight generation finishes; new work queues. Nothing gets killed
-  mid-response.
+- A hard starvation ceiling. Past a fixed maximum wait, a model becomes mandatory regardless of score. Fairness is a correctness property, not a tuning parameter — this is the backstop for when I get the weights wrong.
+- Drain before switch. In-flight generation finishes; new work queues. Nothing gets killedmid-response.
 
 ## Architecture
 
@@ -75,32 +64,33 @@ sitting in the middle of that, and the design choices follow from it:
 
 Two boundaries matter:
 
-1. **Policy vs. mechanism.** The scheduler decides *what should run*; the backend manager decides
-   *how to run it*. The scheduler never touches a vLLM process directly, so swapping in Triton — or
-   a mock — changes nothing above that line.
-2. **Clients vs. residency.** Services address logical model names and never learn what's loaded.
+1. Policy vs. mechanism. The scheduler decides what should run and the backend manager decides how to run it. The scheduler never touches a vLLM process directly, so swapping in Triton or a mock changes nothing above that line.
+2. Clients vs. residency. Services address model names and never learn what's loaded.
 
-## Plan of attack
+## Wire format
 
-**Phase 1 — Prototype against a mock backend.** API surface, model registry, per-model queues, and
-the scheduler, with a simulated backend whose load and generation times are configurable. The point
-is to get scheduler behavior right without ever touching the GPU, and to build the test suite that
-proves it: alternating workloads that must not thrash, a starving model that must get served, bursts
-that must group, priority ordering, crash recovery, client cancellation.
+A service talks to `sir` exactly as it would talk to vLLM directly. Same endpoint paths, same request body, same `model` string — the tag that backend actually serves, not a nickname `sir` invented:
 
-**Phase 2 — One real vLLM backend.** Implement the backend interface for real: start, health,
-generate, stream, cancel. At the end of this phase `sir` is a transparent, boring inference endpoint
-that happens to have a scheduler behind it.
+```bash
+# straight at vLLM
+curl vllm-host:8000/v1/chat/completions -d '{"model":"Qwen/Qwen3-8B", ...}'
+# through sir, byte-for-byte identical
+curl sir-host:8000/v1/chat/completions  -d '{"model":"Qwen/Qwen3-8B", ...}'
+```
 
-**Phase 3 — Real model switching.** Two mutually exclusive models. Drain, unload, load, verify,
-dispatch. Measure what swaps actually cost instead of guessing.
+Config carries both identities. `name` is internal: it labels the model in logs and `/status`, because a swap timeline reading `chat -> translate` is legible and one reading `Qwen/Qwen3-8B -> facebook/nllb-200-distilled-600M` is not. `served_model_name` is what clients send, and matches what you would pass to vLLM's `--served-model-name`, aliases included. The internal label is not routable.
 
-**Phase 4 — Scheduler refinement.** Feed real measurements back in: switch-cost estimation, request
-cost estimation, minimum residency, priorities. Tune against the Phase 1 test suite plus recorded
-production traffic.
+`sir` reads two fields out of a request body: `model`, to pick a queue, and `stream`, to pick a response shape. Everything else is forwarded untouched.
 
-**Phase 5 — Make it homelab infrastructure.** Structured logs, metrics, API keys, crash recovery,
-config validation, deployment. Runs unattended.
+### Do vLLM and SGLang accept the same thing?
+
+The OpenAI core, yes — both serve `/v1/chat/completions` with the same standard fields. The extras are where they part. Both add sampling knobs OpenAI doesn't have, and the sets overlap without matching: `top_k`, `min_p`, `repetition_penalty`, `ignore_eos` and `stop_token_ids` are common to both, while structured output diverges outright, vLLM having used `guided_json` / `guided_regex` / `guided_grammar` where SGLang uses `json_schema` / `regex` / `ebnf`. SGLang also has a native `/generate` endpoint in an entirely different shape. Both sets move between releases.
+
+That divergence argues against adapters rather than for them. Forwarding the body as sent means whatever the configured backend accepts, its clients can send — including fields that didn't exist when this was written. An adapter layer would have to model every extra, get updated on every release of both projects, and would quietly drop whatever it hadn't learned yet. The only thing adapters would buy is translating a vLLM-shaped request into an SGLang-shaped one, and nothing here needs that: each model is addressed by the tag its own backend serves. If that changes, the pass-through is the layer an adapter would slot into.
+
+## Implementation Roadmap
+
+[docs/ROADMAP.md](github.com/ida314/stupid-inference-router)
 
 ### MVP
 
@@ -113,7 +103,7 @@ At that point it's infrastructure rather than a proxy.
 
 ## Running it
 
-Phase 1 is implemented: the full API, registry, queues, and scheduler, against a mock backend.
+Currently phase 1 is finished, against a mock backend.
 
 ```bash
 uv sync --extra dev
@@ -126,7 +116,8 @@ Then, from anywhere:
 
 ```bash
 curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"model":"translate","messages":[{"role":"user","content":"hola"}]}'
+  -d '{"model":"facebook/nllb-200-distilled-600M","messages":[{"role":"user","content":"hola"}]}'
+curl localhost:8000/v1/models       # the tags clients may address
 curl localhost:8000/status          # residency, queue depths, and the last decision's scores
 ```
 
