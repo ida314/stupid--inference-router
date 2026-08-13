@@ -27,8 +27,13 @@ scheduler:
   tick_interval_seconds: 0.25
   backend_retry_seconds: 5
 
+# `name` is internal: it labels the model in logs and `/status` and never leaves the
+# process. `served_model_name` is what clients put in `model`, and must match the tag the
+# backend serves — the same string you would pass to vLLM's `--served-model-name`. A
+# service therefore sends `sir` exactly what it would send vLLM directly.
 models:
   - name: chat
+    served_model_name: Qwen/Qwen3-8B
     backend: mock
     priority: 1.0
     mock:
@@ -38,7 +43,12 @@ models:
       default_max_tokens: 64
 
   # Lower volume, but latency-sensitive, so it buys back some ground with priority.
+  # Several aliases are allowed; the first is canonical, and the rest are useful while
+  # services are still being migrated onto the real tag.
   - name: translate
+    served_model_name:
+      - facebook/nllb-200-distilled-600M
+      - translate
     backend: mock
     priority: 1.5
     mock:

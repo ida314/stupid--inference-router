@@ -474,6 +474,7 @@ class Engine:
             "models": [
                 {
                     "name": model.name,
+                    "served_as": model.served_as,
                     "priority": model.priority,
                     "queue_depth": self.queues.depth(model.name),
                     "oldest_wait_seconds": round(

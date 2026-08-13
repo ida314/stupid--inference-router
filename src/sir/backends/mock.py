@@ -85,6 +85,9 @@ class MockBackend:
 
         budget = request.max_tokens or self._params.default_max_tokens
         interval = 1.0 / self._params.tokens_per_second
+        # Echo the tag the request was routed to, so the response shows what a real
+        # backend would have generated from rather than `sir`'s internal label.
+        tag = str(request.payload.get("model") or self._model_name)
         # Die a couple of tokens in, so the test exercises a *mid-stream* failure and not
         # merely a rejected request.
         crash_at = 2 if should_crash else None
@@ -97,7 +100,7 @@ class MockBackend:
                     f"backend for {self._model_name!r} died mid-generation "
                     f"(injected crash after {crash_after} request(s))"
                 )
-            yield Chunk(text=_token(self._model_name, index), index=index)
+            yield Chunk(text=_token(tag, index), index=index)
             await self._clock.sleep(interval)
 
         self.requests_completed += 1

@@ -4,6 +4,13 @@ Services already speak this dialect, so `sir` speaks it too — that's the entir
 service can be pointed at `:8000` and stop caring which model is loaded. Requests carry
 `extra="allow"` because real OpenAI clients send fields we don't implement, and rejecting
 a request over `top_p` would be a poor way to introduce a router.
+
+The models below are validation and routing only, never a filter. `sir` needs `model` to
+pick a queue and `stream` to pick a response shape; everything else is forwarded to the
+backend untouched, including the extras vLLM and SGLang each add on top of the OpenAI
+schema. So the fields here are typed loosely on purpose — a bound like `max_tokens > 0`
+would be `sir` enforcing a rule it doesn't own, and would turn a backend's future
+behaviour into a router bug.
 """
 
 from __future__ import annotations
@@ -34,19 +41,23 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage] = Field(min_length=1)
     stream: bool = False
-    max_tokens: int | None = Field(default=None, gt=0)
-    max_completion_tokens: int | None = Field(default=None, gt=0)
-    temperature: float = 1.0
 
-    def token_budget(self) -> int | None:
-        return self.max_completion_tokens or self.max_tokens
+    def to_generation_request(
+        self, internal_name: str, backend_tag: str, request_id: str = ""
+    ) -> GenerationRequest:
+        """Build the backend-bound request, preserving the client's body as sent.
 
-    def to_generation_request(self, request_id: str) -> GenerationRequest:
+        `exclude_unset` is what makes this a pass-through rather than a rewrite: a field
+        the client omitted stays omitted, so the backend applies its own default instead
+        of one `sir` invented. Only `model` is changed, from the tag the client used to
+        the one the backend answers to.
+        """
+        payload = self.model_dump(exclude_unset=True, exclude_none=False)
+        payload["model"] = backend_tag
         return GenerationRequest(
-            model=self.model,
-            prompt=render_prompt(self.messages),
-            max_tokens=self.token_budget(),
-            temperature=self.temperature,
+            model=internal_name,
+            served_model=self.model,
+            payload=payload,
             request_id=request_id,
         )
 
@@ -104,6 +115,9 @@ class ModelCard(BaseModel):
     object: Literal["model"] = "model"
     created: int = Field(default_factory=_now)
     owned_by: str = "sir"
+    # vLLM reports the underlying model an alias points at; clients that resolve aliases
+    # read this. For a model with one served name, `root` is just `id`.
+    root: str | None = None
 
 
 class ModelList(BaseModel):

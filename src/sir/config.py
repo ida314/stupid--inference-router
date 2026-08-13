@@ -35,12 +35,46 @@ class MockParams(BaseModel):
 class ModelConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
+    # Internal label. Appears in config, logs, and `/status`, and never on the wire —
+    # a timeline reading `chat -> translate` is legible in a way that one reading
+    # `Qwen/Qwen3-8B -> facebook/nllb-200-distilled-600M` is not.
     name: str = Field(min_length=1)
+
+    # What clients put in `model`. This is the identity `sir` shares with the backend,
+    # so it must be the tag the backend itself serves — mirroring vLLM's
+    # `--served-model-name`, including its support for several aliases per model.
+    # Defaults to `name` so small configs stay small.
+    served_model_name: str | list[str] | None = None
+
     backend: BackendKind = "mock"
     # Multiplies the model's score. A translation model that must feel snappy despite low
     # volume gets a higher number than a batch summarizer.
     priority: float = Field(default=1.0, gt=0)
     mock: MockParams = Field(default_factory=MockParams)
+
+    @property
+    def served_names(self) -> list[str]:
+        """Every tag a client may address this model by."""
+        if self.served_model_name is None:
+            return [self.name]
+        if isinstance(self.served_model_name, str):
+            return [self.served_model_name]
+        return list(self.served_model_name)
+
+    @property
+    def served_as(self) -> str:
+        """The canonical tag, sent to the backend and reported in `/status`."""
+        return self.served_names[0]
+
+    @model_validator(mode="after")
+    def _served_names_are_usable(self) -> ModelConfig:
+        names = self.served_names
+        if not names or any(not name.strip() for name in names):
+            raise ValueError(
+                f"model {self.name!r} has an empty served_model_name; omit the field to "
+                "fall back to the model name"
+            )
+        return self
 
     @property
     def estimated_load_seconds(self) -> float:
@@ -102,17 +136,41 @@ class AppConfig(BaseModel):
             if model.name in seen:
                 raise ValueError(f"duplicate model name: {model.name!r}")
             seen.add(model.name)
+
+        # Two models answering to one tag would make routing depend on config order.
+        served: dict[str, str] = {}
+        for model in self.models:
+            for tag in model.served_names:
+                if tag in served:
+                    raise ValueError(
+                        f"duplicate served_model_name {tag!r}: claimed by both "
+                        f"{served[tag]!r} and {model.name!r}"
+                    )
+                served[tag] = model.name
         return self
 
     def model_by_name(self, name: str) -> ModelConfig | None:
+        """Look up by internal label. For config and logs, never for client input."""
         for model in self.models:
             if model.name == name:
+                return model
+        return None
+
+    def model_by_served_name(self, tag: str) -> ModelConfig | None:
+        """Resolve what a client asked for. The only lookup the API is allowed to use."""
+        for model in self.models:
+            if tag in model.served_names:
                 return model
         return None
 
     @property
     def model_names(self) -> list[str]:
         return [model.name for model in self.models]
+
+    @property
+    def served_model_names(self) -> list[str]:
+        """Every tag clients may address, in config order."""
+        return [tag for model in self.models for tag in model.served_names]
 
 
 def load_config(path: str | Path) -> AppConfig:

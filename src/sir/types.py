@@ -10,6 +10,7 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 
 # --------------------------------------------------------------------------------------
@@ -19,13 +20,35 @@ from enum import StrEnum
 
 @dataclass(frozen=True)
 class GenerationRequest:
-    """What a backend needs to produce tokens. Deliberately backend-agnostic."""
+    """A client request, carried in the shape the backend will actually receive.
+
+    `payload` is the client's own JSON body, forwarded verbatim except that `model` is
+    rewritten to the tag the backend serves. `sir` deliberately does not model the
+    sampling parameters: vLLM and SGLang each add their own non-standard fields, those
+    sets drift between releases, and a router that parses them would have to be updated
+    every time one does. Whatever it doesn't route on, it doesn't interpret.
+    """
 
     model: str
-    prompt: str
-    max_tokens: int | None = None
-    temperature: float = 1.0
+    """Internal scheduler key — the config's `name`. Never appears on the wire."""
+
+    served_model: str
+    """The tag the client asked for, echoed back so responses match the request."""
+
+    payload: dict[str, Any] = field(default_factory=dict)
     request_id: str = ""
+
+    @property
+    def max_tokens(self) -> int | None:
+        """The token budget, if the client set one. Read, but still passed through."""
+        value = self.payload.get("max_completion_tokens")
+        if value is None:
+            value = self.payload.get("max_tokens")
+        return int(value) if value is not None else None
+
+    @property
+    def stream(self) -> bool:
+        return bool(self.payload.get("stream", False))
 
 
 @dataclass(frozen=True)
