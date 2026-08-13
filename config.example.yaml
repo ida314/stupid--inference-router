@@ -1,0 +1,48 @@
+# Example config: the README's MVP scenario — two models that cannot be co-resident,
+# with several services firing at both. The mock backend stands in for the GPU, so this
+# file runs end to end on a laptop.
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  log_level: info
+
+scheduler:
+  # Hysteresis. A freshly loaded model keeps the GPU this long while it has work, so
+  # alternating traffic buys one swap instead of one per request.
+  min_residency_seconds: 30
+
+  # The starvation ceiling. Past this, a waiting model becomes mandatory no matter what
+  # the scores say. This is a correctness backstop, not a tuning knob.
+  max_wait_seconds: 120
+
+  # score = priority * (age_weight * oldest_wait + depth_weight * depth) - switch_cost
+  age_weight: 1.0
+  depth_weight: 0.5
+  # Multiplies the model's load time. At 1.0, a challenger must be worth its own load
+  # time in accumulated demand before it takes the GPU.
+  switch_cost_weight: 1.0
+
+  max_concurrent_requests: 8
+  tick_interval_seconds: 0.25
+  backend_retry_seconds: 5
+
+models:
+  - name: chat
+    backend: mock
+    priority: 1.0
+    mock:
+      load_seconds: 8
+      tokens_per_second: 40
+      first_token_seconds: 0.2
+      default_max_tokens: 64
+
+  # Lower volume, but latency-sensitive, so it buys back some ground with priority.
+  - name: translate
+    backend: mock
+    priority: 1.5
+    mock:
+      load_seconds: 6
+      tokens_per_second: 60
+      first_token_seconds: 0.1
+      default_max_tokens: 48
