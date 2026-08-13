@@ -7,8 +7,8 @@ GPU that has room for one.
 
 from __future__ import annotations
 
-from sir.types import EventKind, GenerationRequest, RequestState
-from tests.sim import Arrival, alternating, build_config, running_engine, simulate
+from sir.types import EventKind, RequestState
+from tests.sim import Arrival, alternating, build_config, generation, running_engine, simulate
 
 
 async def test_the_swap_sequence_is_drain_unload_load():
@@ -58,7 +58,7 @@ async def test_only_one_model_is_ever_resident(clock):
         for index in range(12):
             model_name = "chat" if index % 2 == 0 else "translate"
             engine.submit(
-                GenerationRequest(model=model_name, prompt="x", max_tokens=8)
+                generation(model_name, max_tokens=8)
             )
             await clock.advance(2.0)
             # The engine tracks exactly one resident model, and nothing else is loaded.
@@ -79,13 +79,13 @@ async def test_a_drain_waits_for_generation_but_not_for_a_departed_client(clock)
 
     async with running_engine(config, clock) as engine:
         slow = engine.submit(
-            GenerationRequest(model="chat", prompt="x", max_tokens=100000)
+            generation("chat", max_tokens=100000)
         )
         await clock.advance(10.0)  # load (8s) then dispatch
         assert slow.state is RequestState.RUNNING
 
         slow.cancel()
-        engine.submit(GenerationRequest(model="translate", prompt="x", max_tokens=8))
+        engine.submit(generation("translate", max_tokens=8))
 
         # Without cancellation-aware draining, the 100k-token request would block this
         # swap for the better part of an hour.

@@ -5,12 +5,13 @@ from __future__ import annotations
 import pytest
 
 from sir.queues import ModelQueues
-from sir.types import GenerationRequest, QueuedRequest, RequestState
+from sir.types import QueuedRequest, RequestState
+from tests.sim import generation
 
 
 def request(model: str, at: float) -> QueuedRequest:
     return QueuedRequest(
-        request=GenerationRequest(model=model, prompt="x"), enqueued_at=at
+        request=generation(model), enqueued_at=at
     )
 
 

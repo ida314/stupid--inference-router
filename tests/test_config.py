@@ -25,6 +25,60 @@ def test_the_shipped_example_config_loads():
     assert config.model_by_name("chat").estimated_load_seconds == 8.0
 
 
+# ---------------------------------------------------------------- served model names
+
+
+def test_the_served_name_defaults_to_the_internal_name():
+    config = AppConfig.model_validate({"models": [{"name": "chat"}]})
+    assert config.served_model_names == ["chat"]
+    assert config.model_by_served_name("chat").name == "chat"
+
+
+def test_clients_address_the_served_tag_not_the_internal_label():
+    """The internal name is a logging convenience and must not be routable."""
+    config = AppConfig.model_validate(
+        {"models": [{"name": "chat", "served_model_name": "Qwen/Qwen3-8B"}]}
+    )
+    assert config.served_model_names == ["Qwen/Qwen3-8B"]
+    assert config.model_by_served_name("Qwen/Qwen3-8B").name == "chat"
+    assert config.model_by_served_name("chat") is None
+
+
+def test_several_aliases_are_allowed_and_the_first_is_canonical():
+    """Mirrors vLLM's repeated `--served-model-name`, for migrating services."""
+    config = AppConfig.model_validate(
+        {
+            "models": [
+                {"name": "translate", "served_model_name": ["facebook/nllb-200", "translate"]}
+            ]
+        }
+    )
+    model = config.model_by_name("translate")
+    assert model.served_as == "facebook/nllb-200"
+    assert config.model_by_served_name("translate") is model
+    assert config.model_by_served_name("facebook/nllb-200") is model
+
+
+def test_two_models_cannot_claim_the_same_served_tag():
+    """Otherwise routing would depend on config order."""
+    with pytest.raises(ValidationError, match="duplicate served_model_name"):
+        AppConfig.model_validate(
+            {
+                "models": [
+                    {"name": "a", "served_model_name": "shared/tag"},
+                    {"name": "b", "served_model_name": ["other/tag", "shared/tag"]},
+                ]
+            }
+        )
+
+
+def test_an_empty_served_name_is_rejected():
+    with pytest.raises(ValidationError, match="empty served_model_name"):
+        AppConfig.model_validate(
+            {"models": [{"name": "chat", "served_model_name": "  "}]}
+        )
+
+
 def test_a_missing_file_says_so():
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/config.yaml")

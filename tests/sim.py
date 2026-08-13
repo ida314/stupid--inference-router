@@ -47,6 +47,30 @@ def model(name: str, priority: float = 1.0, **mock: object) -> ModelConfig:
     return ModelConfig(name=name, priority=priority, mock=MockParams(**mock))
 
 
+def generation(
+    name: str,
+    *,
+    max_tokens: int | None = None,
+    served_model: str | None = None,
+    content: str = "simulated request",
+    **extras: object,
+) -> GenerationRequest:
+    """Build a request the way the API layer would, for tests that skip HTTP.
+
+    `extras` land in the payload untouched, which is how pass-through gets exercised
+    below the API — the scheduler must not care what's in there.
+    """
+    tag = served_model or name
+    payload: dict[str, object] = {
+        "model": tag,
+        "messages": [{"role": "user", "content": content}],
+        **extras,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    return GenerationRequest(model=name, served_model=tag, payload=payload)
+
+
 def build_config(models: list[ModelConfig] | None = None, **scheduler: object) -> AppConfig:
     """A two-model config with fast defaults, overridable per test.
 
@@ -211,11 +235,7 @@ async def simulate(
             for arrival in batch:
                 submitted.append(
                     engine.submit(
-                        GenerationRequest(
-                            model=arrival.model,
-                            prompt="simulated request",
-                            max_tokens=arrival.max_tokens,
-                        )
+                        generation(arrival.model, max_tokens=arrival.max_tokens)
                     )
                 )
         await clock.advance_to(until)

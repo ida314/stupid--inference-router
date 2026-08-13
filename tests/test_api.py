@@ -13,12 +13,15 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
 from sir.api import create_app
+from sir.backends.mock import MockBackend
+from sir.config import AppConfig, ModelConfig, SchedulerConfig
 from tests.sim import build_config, model
 
 
@@ -54,13 +57,40 @@ def fast_config():
 
 @pytest.fixture
 async def client() -> AsyncIterator[httpx.AsyncClient]:
-    app: FastAPI = create_app(fast_config())
+    async with serving(fast_config()) as (http, _):
+        yield http
+
+
+@asynccontextmanager
+async def serving(config) -> AsyncIterator[tuple[httpx.AsyncClient, list[dict]]]:
+    """A live app plus the list of payloads its backends actually received.
+
+    Recording at the backend is the only honest place to assert pass-through: it's the
+    last point before the bytes would go on the wire to vLLM.
+    """
+    seen: list[dict] = []
+
+    def factory(model_config, clock):
+        return RecordingBackend(model_config, clock, seen)
+
+    app: FastAPI = create_app(config, backend_factory=factory)
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport, base_url="http://sir.test", timeout=30
         ) as http:
-            yield http
+            yield http, seen
+
+
+class RecordingBackend(MockBackend):
+    def __init__(self, model_config, clock, sink: list[dict]) -> None:
+        super().__init__(model_config.name, model_config.mock, clock)
+        self._sink = sink
+
+    async def stream(self, request):
+        self._sink.append(request.payload)
+        async for chunk in super().stream(request):
+            yield chunk
 
 
 def chat_body(model_name: str, **extra: object) -> dict[str, object]:
@@ -143,6 +173,122 @@ async def test_unknown_fields_from_real_clients_are_tolerated(client):
         "/v1/chat/completions", json=chat_body("chat", top_p=0.9, seed=1, user="svc")
     )
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------- provider pass-through
+
+
+def tagged_config():
+    """Two models addressed by their real served tags, one with a legacy alias."""
+    return AppConfig(
+        models=[
+            ModelConfig(
+                name="chat",
+                served_model_name="Qwen/Qwen3-8B",
+                mock=fast_config().models[0].mock,
+            ),
+            ModelConfig(
+                name="translate",
+                served_model_name=["facebook/nllb-200-distilled-600M", "translate"],
+                mock=fast_config().models[1].mock,
+            ),
+        ],
+        scheduler=SchedulerConfig(
+            min_residency_seconds=0.05,
+            max_wait_seconds=1.0,
+            tick_interval_seconds=0.01,
+        ),
+    )
+
+
+async def test_provider_specific_fields_reach_the_backend_untouched():
+    """vLLM and SGLang each extend the OpenAI schema; `sir` forwards, never filters."""
+    extras = {
+        # vLLM
+        "guided_json": {"type": "object"},
+        "stop_token_ids": [128001],
+        "ignore_eos": True,
+        # SGLang
+        "regex": r"\d+",
+        "separate_reasoning": True,
+        # common to both
+        "top_k": 40,
+        "repetition_penalty": 1.05,
+        "min_p": 0.03,
+    }
+    async with serving(tagged_config()) as (client, seen):
+        response = await client.post(
+            "/v1/chat/completions", json=chat_body("Qwen/Qwen3-8B", **extras)
+        )
+        assert response.status_code == 200
+
+    assert len(seen) == 1
+    for key, value in extras.items():
+        assert seen[0][key] == value, f"{key} was altered or dropped in transit"
+
+
+async def test_omitted_fields_stay_omitted():
+    """`sir` must not invent a temperature the client never asked for."""
+    async with serving(tagged_config()) as (client, seen):
+        await client.post("/v1/chat/completions", json=chat_body("Qwen/Qwen3-8B"))
+
+    payload = seen[0]
+    assert "temperature" not in payload
+    assert "max_tokens" not in payload
+    assert "top_p" not in payload
+    assert set(payload) == {"model", "messages"}
+
+
+async def test_the_model_field_is_rewritten_to_the_tag_the_backend_serves():
+    """An alias is resolved here, so the backend always sees its canonical name."""
+    async with serving(tagged_config()) as (client, seen):
+        response = await client.post(
+            "/v1/chat/completions", json=chat_body("translate")
+        )
+        assert response.status_code == 200
+        # The response echoes what the client asked for...
+        assert response.json()["model"] == "translate"
+
+    # ...while the backend was addressed by its real tag.
+    assert seen[0]["model"] == "facebook/nllb-200-distilled-600M"
+
+
+async def test_the_internal_label_is_not_routable():
+    """`name: chat` is for logs. Clients must use the served tag."""
+    async with serving(tagged_config()) as (client, _):
+        response = await client.post("/v1/chat/completions", json=chat_body("chat"))
+        assert response.status_code == 404
+        assert "Qwen/Qwen3-8B" in response.json()["error"]["message"]
+
+
+async def test_models_are_listed_under_every_served_tag():
+    async with serving(tagged_config()) as (client, _):
+        body = (await client.get("/v1/models")).json()
+
+    cards = {card["id"]: card for card in body["data"]}
+    assert set(cards) == {
+        "Qwen/Qwen3-8B",
+        "facebook/nllb-200-distilled-600M",
+        "translate",
+    }
+    # An alias points at the canonical tag, as vLLM reports it.
+    assert cards["translate"]["root"] == "facebook/nllb-200-distilled-600M"
+
+
+async def test_streaming_passes_provider_extras_through_too():
+    async with serving(tagged_config()) as (client, seen):
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json=chat_body("Qwen/Qwen3-8B", stream=True, top_k=20, ignore_eos=True),
+        ) as response:
+            assert response.status_code == 200
+            async for _ in response.aiter_lines():
+                pass
+
+    assert seen[0]["top_k"] == 20
+    assert seen[0]["ignore_eos"] is True
+    assert seen[0]["stream"] is True
 
 
 # ---------------------------------------------------------------- streaming

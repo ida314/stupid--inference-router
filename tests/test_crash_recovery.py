@@ -8,8 +8,8 @@ worse than the per-service vLLM setup this project exists to replace.
 from __future__ import annotations
 
 from sir.config import ModelConfig
-from sir.types import GenerationRequest, QueuedRequest, RequestState, StreamEvent, StreamError
-from tests.sim import build_config, model, running_engine
+from sir.types import QueuedRequest, RequestState, StreamEvent, StreamError
+from tests.sim import build_config, generation, model, running_engine
 
 
 def crashing(name: str, after: int, **kw: object) -> ModelConfig:
@@ -37,8 +37,8 @@ async def test_a_crash_fails_its_own_requests_and_leaves_the_router_serving(cloc
     )
 
     async with running_engine(config, clock) as engine:
-        first = engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=32))
-        second = engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=32))
+        first = engine.submit(generation("chat", max_tokens=32))
+        second = engine.submit(generation("chat", max_tokens=32))
         await clock.advance(6.0)  # load, dispatch, crash
 
         # The dead backend is no longer resident and no longer trusted.
@@ -48,7 +48,7 @@ async def test_a_crash_fails_its_own_requests_and_leaves_the_router_serving(cloc
 
         # The router itself is fine, and the other model is scheduled as normal.
         healthy = engine.submit(
-            GenerationRequest(model="translate", prompt="x", max_tokens=8)
+            generation("translate", max_tokens=8)
         )
         await clock.advance(20.0)
         assert healthy.state is RequestState.DONE
@@ -71,7 +71,7 @@ async def test_a_load_failure_leaves_the_request_queued_for_a_retry(clock):
 
     async with running_engine(config, clock) as engine:
         request = engine.submit(
-            GenerationRequest(model="chat", prompt="x", max_tokens=8)
+            generation("chat", max_tokens=8)
         )
         await clock.advance(5.0)
 
@@ -94,14 +94,14 @@ async def test_a_crashed_model_is_retried_and_recovers(clock):
     )
 
     async with running_engine(config, clock) as engine:
-        engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=8))
-        engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=8))
+        engine.submit(generation("chat", max_tokens=8))
+        engine.submit(generation("chat", max_tokens=8))
         await clock.advance(6.0)
         assert engine.resident is None  # crashed
 
         # A restart gives the backend a fresh process, and one more request fits before
         # the injected fault triggers again.
-        later = engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=8))
+        later = engine.submit(generation("chat", max_tokens=8))
         await clock.advance(30.0)
         assert later.state is RequestState.DONE
         assert engine.loads >= 2
@@ -120,8 +120,8 @@ async def test_an_error_event_carries_a_503_to_the_client(clock):
     config.models[0].mock.crash_after_n_requests = 1
 
     async with running_engine(config, clock) as engine:
-        engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=8))
-        doomed = engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=8))
+        engine.submit(generation("chat", max_tokens=8))
+        doomed = engine.submit(generation("chat", max_tokens=8))
         await clock.advance(6.0)
 
         events = collected(doomed)
@@ -143,13 +143,13 @@ async def test_the_control_loop_survives_a_backend_raising_something_unexpected(
 
         backend.stream = exploding  # type: ignore[method-assign]
 
-        broken = engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=8))
+        broken = engine.submit(generation("chat", max_tokens=8))
         await clock.advance(12.0)
         assert broken.state is RequestState.FAILED
         assert engine.is_running
 
         # Still scheduling.
-        ok = engine.submit(GenerationRequest(model="translate", prompt="x", max_tokens=8))
+        ok = engine.submit(generation("translate", max_tokens=8))
         await clock.advance(30.0)
         assert ok.state is RequestState.DONE
         assert engine.is_running

@@ -7,8 +7,8 @@ hold up the next drain.
 
 from __future__ import annotations
 
-from sir.types import GenerationRequest, RequestState
-from tests.sim import build_config, running_engine
+from sir.types import RequestState
+from tests.sim import build_config, generation, running_engine
 
 
 async def test_a_queued_request_that_is_cancelled_is_never_dispatched(clock):
@@ -16,10 +16,10 @@ async def test_a_queued_request_that_is_cancelled_is_never_dispatched(clock):
 
     async with running_engine(config, clock) as engine:
         doomed = engine.submit(
-            GenerationRequest(model="chat", prompt="x", max_tokens=8)
+            generation("chat", max_tokens=8)
         )
         keeper = engine.submit(
-            GenerationRequest(model="chat", prompt="x", max_tokens=8)
+            generation("chat", max_tokens=8)
         )
         doomed.cancel()  # while the backend is still loading
 
@@ -34,12 +34,12 @@ async def test_a_cancelled_queue_cannot_trigger_a_swap(clock):
     config = build_config(min_residency_seconds=0, max_wait_seconds=30)
 
     async with running_engine(config, clock) as engine:
-        engine.submit(GenerationRequest(model="chat", prompt="x", max_tokens=8))
+        engine.submit(generation("chat", max_tokens=8))
         await clock.advance(12.0)
         assert engine.resident == "chat"
 
         ghosts = [
-            engine.submit(GenerationRequest(model="translate", prompt="x", max_tokens=8))
+            engine.submit(generation("translate", max_tokens=8))
             for _ in range(20)
         ]
         for ghost in ghosts:
@@ -58,10 +58,10 @@ async def test_cancelling_in_flight_work_frees_the_slot(clock):
 
     async with running_engine(config, clock) as engine:
         hog = engine.submit(
-            GenerationRequest(model="chat", prompt="x", max_tokens=100000)
+            generation("chat", max_tokens=100000)
         )
         waiting = engine.submit(
-            GenerationRequest(model="chat", prompt="x", max_tokens=8)
+            generation("chat", max_tokens=8)
         )
         await clock.advance(10.0)
         assert hog.state is RequestState.RUNNING
@@ -78,7 +78,7 @@ async def test_the_queue_depth_the_scheduler_sees_excludes_cancelled_requests(cl
 
     async with running_engine(config, clock) as engine:
         requests = [
-            engine.submit(GenerationRequest(model="translate", prompt="x", max_tokens=8))
+            engine.submit(generation("translate", max_tokens=8))
             for _ in range(5)
         ]
         assert engine.queues.depth("translate") == 5
