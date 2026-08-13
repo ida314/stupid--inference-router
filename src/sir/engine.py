@@ -26,7 +26,7 @@ from sir.backend import Backend, BackendError
 from sir.backends.mock import MockBackend
 from sir.clock import Clock, RealClock
 from sir.config import AppConfig, ModelConfig
-from sir.policy import decide
+from sir.policy import decide, estimate_wait
 from sir.queues import ModelQueues
 from sir.types import (
     Decision,
@@ -40,11 +40,23 @@ from sir.types import (
     SchedulerSnapshot,
     StreamEnd,
     StreamError,
+    WaitEstimate,
 )
 
 BackendFactory = Callable[[ModelConfig, Clock], Backend]
 
 _HISTORY = 200
+
+# Smoothing for the per-model running average of request duration. Low enough that one
+# unusually long generation doesn't dominate the next client's estimate, high enough to
+# track a genuine shift in workload within a handful of requests. Not a config knob: it
+# only feeds an advisory number, and the config already carries the two dials worth
+# reaching for.
+_EWMA_ALPHA = 0.2
+
+# What a client is told to wait before re-polling a request that is already generating.
+# At that point the queue no longer says anything useful about the remaining time.
+_RUNNING_POLL_SECONDS = 1.0
 
 
 def default_backend_factory(model: ModelConfig, clock: Clock) -> Backend:
@@ -88,6 +100,13 @@ class Engine:
         self._running = False
         self._loop_task: asyncio.Task[None] | None = None
         self._wakeup = asyncio.Event()
+
+        # Seeded from config so the first client to ask gets a plausible number, then
+        # replaced by measurement as requests complete. This is also the first real input
+        # to the roadmap's Phase 4 request-cost estimation.
+        self._mean_seconds: dict[str, float] = {
+            model.name: model.estimated_request_seconds for model in config.models
+        }
 
         self.decisions: deque[Decision] = deque(maxlen=_HISTORY)
         self.events: deque[EngineEvent] = deque(maxlen=_HISTORY)
@@ -245,6 +264,25 @@ class Engine:
             self._emit(EventKind.FAILED, queued.model, detail=repr(exc))
         finally:
             queued.finished_at = self.clock.now()
+            self._observe_duration(queued)
+
+    def _observe_duration(self, queued: QueuedRequest) -> None:
+        """Fold a completed request's duration into its model's running average.
+
+        Only successful completions count. A cancelled request stopped early and a failed
+        one may not have generated at all, so both would drag the average toward zero and
+        make the next client's estimate optimistic in exactly the situation — a flaky
+        backend — where it should not be.
+        """
+        if queued.state is not RequestState.DONE:
+            return
+        if queued.started_at is None or queued.finished_at is None:
+            return
+        observed = max(0.0, queued.finished_at - queued.started_at)
+        previous = self._mean_seconds.get(queued.model, observed)
+        self._mean_seconds[queued.model] = (
+            _EWMA_ALPHA * observed + (1 - _EWMA_ALPHA) * previous
+        )
 
     def _cancel_disconnected(self) -> None:
         """Stop paying for clients that went away."""
@@ -402,6 +440,33 @@ class Engine:
             switching=self._switching,
         )
 
+    def estimate_wait(self, queued: QueuedRequest) -> WaitEstimate | None:
+        """Project `queued`'s remaining wait, or `None` once it is no longer queued.
+
+        `None` means dispatched: the request is generating, and its queue position has
+        stopped saying anything useful about when it will finish.
+        """
+        position = self.queues.position_of(queued)
+        if position is None:
+            return None
+        return estimate_wait(
+            self._snapshot(),
+            queued.model,
+            position,
+            self.clock.now(),
+            self.config.scheduler,
+            self._mean_seconds.get(queued.model, 0.0),
+        )
+
+    @property
+    def running_poll_seconds(self) -> float:
+        """Poll cadence for a request that is already generating."""
+        return _RUNNING_POLL_SECONDS
+
+    def mean_request_seconds(self, model: str) -> float:
+        """The observed running average for `model`. Exposed for `/status`."""
+        return self._mean_seconds.get(model, 0.0)
+
     def _record(self, decision: Decision) -> None:
         # Only log a decision when it says something new — an idle router ticking four
         # times a second must not bury the one line that explains a swap.
@@ -481,6 +546,9 @@ class Engine:
                         now - (self.queues.oldest_enqueued_at(model.name) or now), 3
                     ),
                     "resident": model.name == self._resident,
+                    "mean_request_seconds": round(
+                        self._mean_seconds.get(model.name, 0.0), 3
+                    ),
                     "available_in_seconds": max(
                         0.0,
                         round(self._unavailable_until.get(model.name, now) - now, 3),

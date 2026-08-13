@@ -178,6 +178,43 @@ class SchedulerSnapshot:
         return self.by_name(self.resident) if self.resident else None
 
 
+@dataclass(frozen=True)
+class WaitEstimate:
+    """What a queued request can be told about its own wait.
+
+    Split deliberately into what the scheduler *knows* and what it *guesses*. Position,
+    residency, and the policy ceiling are read straight off scheduler state and are exact.
+    `estimated_seconds` is a projection built on a running average of past request
+    durations, and is advisory — good enough to pace a client's polling, not a deadline.
+    Clients that treat it as one will be wrong the first time a long generation lands.
+    """
+
+    position: int
+    """Index in this model's FIFO among live requests. 0 means next to be dispatched."""
+
+    resident: bool
+    needs_swap: bool
+    """Whether the GPU has to change hands before this request can run at all."""
+
+    load_seconds: float
+    """What that swap costs, or 0.0 when the model is already resident."""
+
+    dispatch_within_seconds: float | None
+    """The starvation ceiling's remaining budget for this model.
+
+    A *head-of-queue* bound: it says when the model is guaranteed to win the GPU, not when
+    this particular request completes. Behind fifty queued requests, the model is served
+    within this window and you are still fiftieth. `None` when no ceiling applies because
+    the model is already resident and serving.
+    """
+
+    estimated_seconds: float
+    """Advisory projection of total time to completion. See the class docstring."""
+
+    retry_after: float
+    """Suggested seconds until the next poll. Derived from `estimated_seconds`."""
+
+
 class DecisionKind(StrEnum):
     IDLE = "idle"
     """No pending work anywhere. The resident model stays loaded — unloading buys nothing."""

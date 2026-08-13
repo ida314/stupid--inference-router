@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from itertools import groupby
 
 from sir.clock import VirtualClock
-from sir.config import AppConfig, ModelConfig, MockParams, SchedulerConfig
+from sir.config import AppConfig, JobsConfig, ModelConfig, MockParams, SchedulerConfig
 from sir.engine import Engine
 from sir.types import (
     Decision,
@@ -71,7 +71,11 @@ def generation(
     return GenerationRequest(model=name, served_model=tag, payload=payload)
 
 
-def build_config(models: list[ModelConfig] | None = None, **scheduler: object) -> AppConfig:
+def build_config(
+    models: list[ModelConfig] | None = None,
+    jobs: JobsConfig | None = None,
+    **scheduler: object,
+) -> AppConfig:
     """A two-model config with fast defaults, overridable per test.
 
     Tests build configs in code rather than from YAML so each scenario states exactly the
@@ -82,7 +86,11 @@ def build_config(models: list[ModelConfig] | None = None, **scheduler: object) -
             model("chat", priority=1.0, load_seconds=8, tokens_per_second=40),
             model("translate", priority=1.0, load_seconds=6, tokens_per_second=40),
         ]
-    return AppConfig(models=models, scheduler=SchedulerConfig(**scheduler))
+    return AppConfig(
+        models=models,
+        scheduler=SchedulerConfig(**scheduler),
+        jobs=jobs or JobsConfig(),
+    )
 
 
 @asynccontextmanager

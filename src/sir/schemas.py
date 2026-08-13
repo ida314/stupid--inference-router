@@ -91,6 +91,44 @@ class ChatCompletionResponse(BaseModel):
     usage: Usage = Field(default_factory=Usage)
 
 
+def build_response(
+    body: ChatCompletionRequest,
+    parts: list[str],
+    finish_reason: str,
+    response_id: str | None = None,
+) -> ChatCompletionResponse:
+    """Render collected chunks as a completion.
+
+    Shared by the synchronous path and the job path so the two cannot drift: a client that
+    submits a request asynchronously must get back exactly what it would have got by
+    waiting on the socket.
+
+    `response_id` derives from the request id, matching what the streaming path puts in its
+    chunks. It has to be passed rather than generated here: a polled job is rendered afresh
+    on every read, and a client that re-fetches a result after a network blip must not be
+    handed a second completion id for the one response it asked for.
+
+    A word count standing in for tokenisation, which belongs to the backend. Phase 2 takes
+    these numbers from the real response instead.
+    """
+    prompt_tokens = len(render_prompt(body.messages).split())
+    return ChatCompletionResponse(
+        **({"id": response_id} if response_id else {}),
+        model=body.model,
+        choices=[
+            ChatChoice(
+                message=ChatMessage(role="assistant", content="".join(parts)),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=len(parts),
+            total_tokens=prompt_tokens + len(parts),
+        ),
+    )
+
+
 class ChatDelta(BaseModel):
     role: str | None = None
     content: str | None = None
@@ -123,6 +161,42 @@ class ModelCard(BaseModel):
 class ModelList(BaseModel):
     object: Literal["list"] = "list"
     data: list[ModelCard]
+
+
+class WaitInfo(BaseModel):
+    """The wire rendering of `WaitEstimate`. See that class for what is fact vs guess."""
+
+    position: int
+    resident: bool
+    needs_swap: bool
+    load_seconds: float
+    # A head-of-queue bound: when the *model* is guaranteed the GPU, not when this request
+    # finishes. Null when the model is already resident.
+    dispatch_within_seconds: float | None = None
+    # Advisory. Paces polling; never treat it as a deadline.
+    estimated_seconds: float
+
+
+class JobDocument(BaseModel):
+    """What `GET /v1/jobs/{id}` returns, and what `202` returns on submission.
+
+    One shape for every stage of a job's life, so a client writes one parser and switches
+    on `status` rather than on which endpoint it called.
+    """
+
+    id: str
+    object: Literal["sir.job"] = "sir.job"
+    status: str
+    model: str
+    created: int = Field(default_factory=_now)
+    # Present while queued, null once generating — at that point the queue no longer says
+    # anything useful about the remaining time.
+    wait: WaitInfo | None = None
+    # Seconds to wait before polling again. Always present, so a client never has to
+    # invent a cadence of its own.
+    retry_after: float = 1.0
+    response: ChatCompletionResponse | None = None
+    error: dict[str, Any] | None = None
 
 
 def error_body(message: str, kind: str = "invalid_request_error", code: str | None = None) -> dict[str, Any]:

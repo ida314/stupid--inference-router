@@ -27,6 +27,25 @@ scheduler:
   tick_interval_seconds: 0.25
   backend_retry_seconds: 5
 
+# Async submission: `Prefer: respond-async` returns a job to poll instead of holding the
+# connection open for the whole wait. Changes nothing for a client that doesn't ask.
+jobs:
+  enabled: true
+
+  # A job nobody polls for is cancelled after this long, the way a dropped connection is.
+  # Keep it below `max_wait_seconds` above — that ordering is what stops abandoned work
+  # from reaching the starvation ceiling, where a swap stops being a judgement call.
+  lease_seconds: 60
+
+  # How long a finished result is kept for a client that never came back for it, and how
+  # long after it has been read. The second is shorter but not zero, so a connection
+  # failure mid-fetch doesn't lose the answer.
+  result_ttl_seconds: 300
+  read_ttl_seconds: 60
+
+  sweep_interval_seconds: 1
+  max_jobs: 1000
+
 # `name` is internal: it labels the model in logs and `/status` and never leaves the
 # process. `served_model_name` is what clients put in `model`, and must match the tag the
 # backend serves — the same string you would pass to vLLM's `--served-model-name`. A

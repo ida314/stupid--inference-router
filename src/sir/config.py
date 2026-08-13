@@ -84,6 +84,19 @@ class ModelConfig(BaseModel):
         """
         return self.mock.load_seconds
 
+    @property
+    def estimated_request_seconds(self) -> float:
+        """Opening guess at how long one request takes, before any have been observed.
+
+        Only ever the seed for the engine's running average — the moment a real request
+        completes, measurement takes over. It exists so the first client to ask for a wait
+        estimate doesn't get told zero.
+        """
+        return (
+            self.mock.first_token_seconds
+            + self.mock.default_max_tokens / self.mock.tokens_per_second
+        )
+
 
 class SchedulerConfig(BaseModel):
     model_config = {"extra": "forbid"}
@@ -114,6 +127,52 @@ class SchedulerConfig(BaseModel):
         return self
 
 
+class JobsConfig(BaseModel):
+    """The async submission path: clients that would rather poll than hold a socket open.
+
+    Off by nothing and on by default, because it changes no behaviour for a client that
+    doesn't ask for it — a request without the opt-in header is served exactly as before.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    enabled: bool = True
+
+    # Polling is the liveness signal. Holding a socket open is what tells `sir` today that
+    # a client still wants its answer; once the socket is gone, polling has to carry that
+    # signal instead. A job unpolled for this long is cancelled exactly as a dropped
+    # connection cancels, which bounds how long abandoned work can go on costing GPU time.
+    #
+    # Keep this below `scheduler.max_wait_seconds` — the default pair is 60 against 120.
+    # That ordering is what stops abandoned work from reaching the starvation ceiling,
+    # where a swap becomes mandatory and outranks every other consideration. It does not
+    # prevent a *scored* swap, which can happen within seconds of a request arriving; no
+    # lease short enough to catch that would be long enough to be safe.
+    #
+    # Set to 0 to disable, accepting that a crashed service leaves its queued work behind.
+    lease_seconds: float = Field(default=60.0, ge=0)
+
+    # How long a finished result is kept for a client that never came back for it...
+    result_ttl_seconds: float = Field(default=300.0, gt=0)
+    # ...and how long after it *has* been read. Shorter, but not zero: dropping the result
+    # the instant it is first fetched makes a connection failure mid-fetch unrecoverable.
+    read_ttl_seconds: float = Field(default=60.0, gt=0)
+
+    sweep_interval_seconds: float = Field(default=1.0, gt=0)
+    # A ceiling on retained jobs, so an unattended router can't grow without bound.
+    max_jobs: int = Field(default=1000, gt=0)
+
+    @model_validator(mode="after")
+    def _lease_outlives_a_sweep(self) -> JobsConfig:
+        if self.lease_seconds and self.lease_seconds <= self.sweep_interval_seconds:
+            raise ValueError(
+                "lease_seconds must exceed sweep_interval_seconds, otherwise a lease can "
+                "expire before the client has had a chance to renew it "
+                f"(got {self.lease_seconds} <= {self.sweep_interval_seconds})"
+            )
+        return self
+
+
 class ServerConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -127,6 +186,7 @@ class AppConfig(BaseModel):
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    jobs: JobsConfig = Field(default_factory=JobsConfig)
     models: list[ModelConfig] = Field(min_length=1)
 
     @model_validator(mode="after")

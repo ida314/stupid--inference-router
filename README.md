@@ -88,6 +88,33 @@ The OpenAI core, yes — both serve `/v1/chat/completions` with the same standar
 
 That divergence argues against adapters rather than for them. Forwarding the body as sent means whatever the configured backend accepts, its clients can send — including fields that didn't exist when this was written. An adapter layer would have to model every extra, get updated on every release of both projects, and would quietly drop whatever it hadn't learned yet. The only thing adapters would buy is translating a vLLM-shaped request into an SGLang-shaped one, and nothing here needs that: each model is addressed by the tag its own backend serves. If that changes, the pass-through is the layer an adapter would slot into.
 
+### Not holding the socket open
+
+A request can wait through a drain, an unload, a load, and a queue before it generates a token. Holding an HTTP connection open across all of that is how you find every idle timeout between a service and the router, so a client can ask to be given a handle instead:
+
+```bash
+curl -i sir-host:8000/v1/chat/completions -H 'prefer: respond-async' -d '{"model":"Qwen/Qwen3-8B", ...}'
+# 202 Accepted
+# location: /v1/jobs/req_ab12cd34
+```
+
+Then `GET /v1/jobs/{id}` until `status` is terminal, and `DELETE` to give up early.
+
+The opt-in is a **header, not a body field** — `sir` still reads only `model` and `stream`, and the body is still forwarded byte-for-byte. It also means the same client code works against a plain vLLM, which ignores the unknown header and answers `200` with the completion. There is nothing to negotiate: `202` means you got a job, `200` means you got the answer.
+
+While a job is queued it reports the wait, split into what the scheduler knows and what it is guessing:
+
+```json
+{"position": 12, "resident": false, "needs_swap": true, "load_seconds": 8.0,
+ "dispatch_within_seconds": 94.2, "estimated_seconds": 47.5}
+```
+
+Everything but the last field is read off scheduler state and is exact. `estimated_seconds` is a projection over a running average of past request durations — good enough to pace polling, not a deadline. And `dispatch_within_seconds` is a **head-of-queue** bound: it says when the *model* is guaranteed the GPU under the starvation ceiling, not when your request finishes. Behind fifty queued requests, the model is served within that window and you are still fiftieth.
+
+Polling doubles as the liveness signal. A held-open socket is what tells `sir` today that a client still wants its answer; a job has no socket, so a job nobody polls for is cancelled once its lease lapses, and abandoned work stops costing GPU time. The default lease is half the starvation ceiling (60s against 120s), which is what stops abandoned work from ever reaching the point where a swap becomes mandatory.
+
+Most services shouldn't hand-roll any of this — see [`clients/python`](clients/python/README.md).
+
 ## Implementation Roadmap
 
 [docs/ROADMAP.md](github.com/ida314/stupid-inference-router)
@@ -119,6 +146,20 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model":"facebook/nllb-200-distilled-600M","messages":[{"role":"user","content":"hola"}]}'
 curl localhost:8000/v1/models       # the tags clients may address
 curl localhost:8000/status          # residency, queue depths, and the last decision's scores
+
+# or, without holding the connection open for the wait
+curl -i localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -H 'prefer: respond-async' \
+  -d '{"model":"translate","messages":[{"role":"user","content":"hola"}]}'
+curl localhost:8000/v1/jobs/<id>    # position, swap, estimate — then the response
+```
+
+From a service, use the client rather than the endpoint:
+
+```python
+from sir_client import run_llm
+
+completion = await run_llm("translate", {"messages": [{"role": "user", "content": "hola"}]})
 ```
 
 Two knobs to reach for first, both under `scheduler:` in the config:

@@ -47,6 +47,21 @@ class ModelQueues:
                 return req.enqueued_at
         return None
 
+    def position_of(self, request: QueuedRequest) -> int | None:
+        """Where `request` sits in its model's queue, counting only live entries.
+
+        Cancelled entries ahead of it are skipped for the same reason `depth` skips them:
+        they will never be dispatched, so counting them would overstate the wait. `None`
+        once the request has been popped — by then it is running, not waiting.
+        """
+        position = 0
+        for queued in self._queues.get(request.model, ()):
+            if queued is request:
+                return position
+            if not queued.cancelled.is_set():
+                position += 1
+        return None
+
     def total_pending(self) -> int:
         return sum(self.depth(name) for name in self._queues)
 

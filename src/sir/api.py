@@ -8,6 +8,13 @@ It has no opinion about the request body either. A service sends `sir` byte-for-
 it would send a vLLM or SGLang server, including that server's non-standard extras, and
 `sir` reads only `model` and `stream` before forwarding the rest. The point is that
 pointing a service at `:8000` is a change of host and nothing else.
+
+That is also why asynchronous submission is opted into with a *header* rather than a body
+field. A client that sends `Prefer: respond-async` gets `202` and a job to poll instead of
+a held-open socket; a client that doesn't gets exactly what it got before. Keeping the
+switch out of the body means `sir` still reads only `model` and `stream`, and it means the
+same client code works against a plain vLLM — which ignores the unknown header and answers
+`200` — with no capability negotiation at all.
 """
 
 from __future__ import annotations
@@ -23,27 +30,29 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from sir import logging as sir_logging
 from sir.clock import Clock
-from sir.config import AppConfig
+from sir.config import AppConfig, JobsConfig
 from sir.engine import BackendFactory, Engine, default_backend_factory
+from sir.jobs import Job, JobStore, JobStoreFull
 from sir.schemas import (
-    ChatChoice,
     ChatChunkChoice,
     ChatCompletionChunk,
     ChatCompletionRequest,
-    ChatCompletionResponse,
     ChatDelta,
-    ChatMessage,
+    JobDocument,
     ModelCard,
     ModelList,
-    Usage,
+    WaitInfo,
+    build_response,
     error_body,
-    render_prompt,
 )
-from sir.types import Chunk, QueuedRequest, StreamEnd, StreamError
+from sir.types import Chunk, QueuedRequest, RequestState, StreamEnd, StreamError
 
 # How often a handler checks whether its client is still there. Uvicorn does not cancel
 # handlers on disconnect, so we ask.
 _DISCONNECT_POLL_SECONDS = 0.2
+
+# RFC 7240's token for "don't make me wait on this connection".
+_ASYNC_PREFERENCE = "respond-async"
 
 
 def create_app(
@@ -60,11 +69,16 @@ def create_app(
             on_decision=sir_logging.log_decision,
             on_event=sir_logging.log_event,
         )
+        jobs = JobStore(config.jobs, clock=engine.clock)
         app.state.engine = engine
+        app.state.jobs = jobs
         await engine.start()
+        await jobs.start()
         try:
             yield
         finally:
+            # Jobs first: their pumps are readers of queues the engine is about to drain.
+            await jobs.stop()
             await engine.stop()
 
     app = FastAPI(title="sir", version="0.1.0", lifespan=lifespan)
@@ -112,11 +126,42 @@ def create_app(
                 ),
             )
 
+        wants_async = config.jobs.enabled and _prefers_async(http)
+        if wants_async and body.stream:
+            # Advisory though `Prefer` is, silently streaming at a client that asked for a
+            # job handle would hang it on a response shape it isn't parsing.
+            return JSONResponse(
+                status_code=400,
+                content=error_body(
+                    "stream and Prefer: respond-async are mutually exclusive; "
+                    "poll the job for a complete response, or stream synchronously"
+                ),
+            )
+
+        # An idempotent resubmission must not buy a second generation. Checked before
+        # `submit`, so the duplicate never reaches a queue at all.
+        key = http.headers.get("idempotency-key")
+        if wants_async and key:
+            existing = _jobs(app).find_by_key(key)
+            if existing is not None:
+                return _accepted(engine, existing, config.jobs)
+
         # Accepted regardless of what is currently loaded. The wait, if any, happens in
         # the queue behind this call — the client never learns the difference.
         queued = engine.submit(
             body.to_generation_request(target.name, target.served_as)
         )
+
+        if wants_async:
+            try:
+                job = _jobs(app).create(queued, body, idempotency_key=key)
+            except JobStoreFull as exc:
+                queued.cancel()
+                return JSONResponse(
+                    status_code=503,
+                    content=error_body(str(exc), kind="server_error", code="jobs_full"),
+                )
+            return _accepted(engine, job, config.jobs)
 
         if body.stream:
             return StreamingResponse(
@@ -126,11 +171,128 @@ def create_app(
             )
         return await _collect(queued, http, body)
 
+    @app.get("/v1/jobs/{job_id}")
+    async def get_job(job_id: str) -> Any:
+        # Reading is what renews the lease, so this is also how a client says "still here".
+        job = _jobs(app).get(job_id)
+        if job is None:
+            return JSONResponse(status_code=404, content=_job_lost(job_id))
+        return JSONResponse(content=_document(_engine(app), job, config.jobs).model_dump(mode="json"))
+
+    @app.delete("/v1/jobs/{job_id}")
+    async def cancel_job(job_id: str) -> Any:
+        job = _jobs(app).cancel(job_id)
+        if job is None:
+            return JSONResponse(status_code=404, content=_job_lost(job_id))
+        return JSONResponse(content=_document(_engine(app), job, config.jobs).model_dump(mode="json"))
+
     return app
 
 
 def _engine(app: FastAPI) -> Engine:
     return app.state.engine
+
+
+def _jobs(app: FastAPI) -> JobStore:
+    return app.state.jobs
+
+
+# ------------------------------------------------------------------ async submission
+
+
+def _prefers_async(http: Request) -> bool:
+    """Is `respond-async` among the client's `Prefer` tokens? (RFC 7240)"""
+    for header in http.headers.getlist("prefer"):
+        for token in header.split(","):
+            if token.strip().lower() == _ASYNC_PREFERENCE:
+                return True
+    return False
+
+
+def _completion_id(request_id: str) -> str:
+    """One request, one completion id, whichever path rendered it."""
+    return f"chatcmpl-{request_id}"
+
+
+def _job_lost(job_id: str) -> dict[str, Any]:
+    # The two causes are indistinguishable from here, and a client's response differs
+    # between them, so name both rather than implying only the first.
+    return error_body(
+        f"job {job_id!r} not found; it has expired or the router restarted",
+        kind="not_found_error",
+        code="job_not_found",
+    )
+
+
+def _accepted(engine: Engine, job: Job, jobs: JobsConfig) -> JSONResponse:
+    document = _document(engine, job, jobs)
+    return JSONResponse(
+        status_code=202,
+        content=document.model_dump(mode="json"),
+        headers={
+            "location": f"/v1/jobs/{job.id}",
+            # Tells the client the preference was actually honoured, so one that also
+            # talks to a plain vLLM can tell `200` -> ignored from `200` -> finished.
+            "preference-applied": _ASYNC_PREFERENCE,
+            "retry-after": str(max(1, round(document.retry_after))),
+        },
+    )
+
+
+def _document(engine: Engine, job: Job, jobs: JobsConfig) -> JobDocument:
+    """Render a job at whatever stage of its life it happens to be in."""
+    estimate = engine.estimate_wait(job.queued) if not job.is_terminal else None
+
+    if estimate is not None:
+        retry_after = estimate.retry_after
+    elif job.is_terminal:
+        retry_after = 0.0
+    else:
+        retry_after = engine.running_poll_seconds
+
+    # Never advise a cadence that would cost the client its lease. Polling is what proves
+    # a client is still there, so a router that says "come back in 30s" while cancelling
+    # anything unseen for 20s would cancel the clients doing exactly as they were told.
+    # Both numbers are known here, which makes this the place to keep them consistent —
+    # cheaper than a config rule the operator has to get right.
+    if jobs.lease_seconds:
+        retry_after = min(retry_after, jobs.lease_seconds / 2)
+
+    response = None
+    error = None
+    if job.state is RequestState.DONE:
+        response = build_response(
+            job.body, job.texts, job.finish_reason, _completion_id(job.id)
+        )
+    elif job.state is RequestState.FAILED and isinstance(job.terminal, StreamError):
+        # The inner object, not the envelope: the job document is the envelope here, and
+        # nesting `{"error": {"error": ...}}` would just make clients unwrap twice.
+        error = error_body(job.terminal.message, kind="server_error")["error"]
+    elif job.state is RequestState.CANCELLED:
+        error = error_body(
+            "job cancelled", kind="cancelled_error", code="job_cancelled"
+        )["error"]
+
+    return JobDocument(
+        id=job.id,
+        status=job.state.value,
+        model=job.body.model,
+        wait=(
+            WaitInfo(
+                position=estimate.position,
+                resident=estimate.resident,
+                needs_swap=estimate.needs_swap,
+                load_seconds=estimate.load_seconds,
+                dispatch_within_seconds=estimate.dispatch_within_seconds,
+                estimated_seconds=estimate.estimated_seconds,
+            )
+            if estimate is not None
+            else None
+        ),
+        retry_after=retry_after,
+        response=response,
+        error=error,
+    )
 
 
 # ------------------------------------------------------------------ client liveness
@@ -181,32 +343,15 @@ async def _collect(
     finally:
         watcher.cancel()
 
-    text = "".join(parts)
     finish_reason = event.finish_reason if isinstance(event, StreamEnd) else "stop"
-    # A word count standing in for tokenisation, which belongs to the backend. Phase 2
-    # takes these numbers from the real response instead.
-    prompt_tokens = len(render_prompt(body.messages).split())
-    return ChatCompletionResponse(
-        model=body.model,
-        choices=[
-            ChatChoice(
-                message=ChatMessage(role="assistant", content=text),
-                finish_reason=finish_reason,
-            )
-        ],
-        usage=Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=len(parts),
-            total_tokens=prompt_tokens + len(parts),
-        ),
-    )
+    return build_response(body, parts, finish_reason, _completion_id(queued.id))
 
 
 async def _sse(
     queued: QueuedRequest, http: Request, model: str
 ) -> AsyncIterator[str]:
     """Server-sent events in OpenAI's chunk format, terminated by `[DONE]`."""
-    stream_id = f"chatcmpl-{queued.id}"
+    stream_id = _completion_id(queued.id)
     watcher = asyncio.create_task(_watch_disconnect(http))
 
     def chunk(delta: ChatDelta, finish_reason: str | None = None) -> str:

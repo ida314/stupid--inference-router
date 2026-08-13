@@ -7,6 +7,16 @@ the GPU, and to build the test suite that proves it: alternating workloads that 
 thrash, a starving model that must get served, bursts that must group, priority ordering,
 crash recovery, client cancellation.
 
+**Phase 1b — Async submission and a client SDK. Done.** `Prefer: respond-async` returns a
+job to poll instead of a held-open connection, carrying the queue position, whether a swap
+is pending, and an advisory estimate. Polling is the liveness signal that a socket used to
+provide, so an abandoned job is cancelled on a lease rather than competing for the GPU
+forever. `clients/python` ships the client half from this repo, so the wire format has one
+home and the contract tests drive the real SDK against the real app in-process.
+
+The per-model running average of request duration added here is the first measured input
+to Phase 4's cost estimation — until then it only paces polling.
+
 **Phase 2 — One real vLLM backend.** Implement the backend interface for real: start,
 health, generate, stream, cancel. Request bodies already arrive in vLLM's own shape and
 are forwarded unmodified, so this phase is about process lifecycle, not translation.

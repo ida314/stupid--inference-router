@@ -35,7 +35,15 @@ from sir.types import (
     ModelState,
     ScoreBreakdown,
     SchedulerSnapshot,
+    WaitEstimate,
 )
+
+# Poll cadence bounds, in seconds. A client is told to come back after a quarter of its
+# projected wait, so a long queue is polled lazily and a short one promptly, but never
+# faster than the scheduler can plausibly change its mind nor slower than a request that
+# finished ages ago would sit unread.
+_MIN_RETRY_AFTER = 0.5
+_MAX_RETRY_AFTER = 10.0
 
 
 def score_model(
@@ -201,6 +209,74 @@ def decide(
         return decision(DecisionKind.SWITCH, reason, best.name)
 
     return decision(DecisionKind.HOLD, DecisionReason.RESIDENT_WINS)
+
+
+def estimate_wait(
+    snapshot: SchedulerSnapshot,
+    model: str,
+    position: int,
+    now: float,
+    config: SchedulerConfig,
+    mean_request_seconds: float,
+) -> WaitEstimate:
+    """Project how long a request at `position` in `model`'s queue will take.
+
+    Pure, like `decide`, and for the same reason: the arithmetic below is the part worth
+    testing, and it should be assertable without a backend, a clock, or an event loop.
+
+    This deliberately does not re-run the scoring. Predicting which model wins the next
+    tick means predicting traffic that hasn't arrived, and a wrong answer dressed up in
+    scheduler arithmetic is worse than an honest bound. What it uses instead are the two
+    numbers the policy actually guarantees — the minimum residency the incumbent still
+    holds, and the starvation ceiling that overrides it — and reports the exact facts
+    beside the guess so a client can tell them apart.
+    """
+    state = snapshot.by_name(model)
+    if state is None:
+        raise KeyError(f"unknown model: {model!r}")
+
+    resident = state.resident
+    ceiling_left = max(0.0, config.max_wait_seconds - state.oldest_wait(now))
+
+    if resident:
+        load_seconds = 0.0
+        # In-flight requests hold slots this one has to wait for, exactly as queued ones do.
+        ahead = position + state.in_flight
+        gpu_wait = 0.0
+    else:
+        load_seconds = state.estimated_load_seconds
+        ahead = position
+        # Hysteresis protects the incumbent, but the starvation ceiling outranks it — so
+        # the wait for the GPU is whichever of the two lapses first, mirroring the
+        # precedence of steps 1 and 5 in `decide`.
+        incumbent = snapshot.resident_state
+        hold = 0.0
+        if incumbent is not None and incumbent.resident_since is not None:
+            hold = max(
+                0.0,
+                config.min_residency_seconds - (now - incumbent.resident_since),
+            )
+        gpu_wait = min(hold, ceiling_left) + load_seconds
+
+        # A crashed backend can't be loaded until its retry backoff expires, whatever the
+        # queue looks like.
+        if not state.is_available(now) and state.unavailable_until is not None:
+            gpu_wait = max(gpu_wait, state.unavailable_until - now + load_seconds)
+
+    # The queue drains `max_concurrent_requests` at a time, so waits step in batches, not
+    # in requests. Being 7th and being 1st are the same wait; being 8th is one batch more.
+    batches = ahead // config.max_concurrent_requests
+    estimated = gpu_wait + batches * mean_request_seconds + mean_request_seconds
+
+    return WaitEstimate(
+        position=position,
+        resident=resident,
+        needs_swap=not resident,
+        load_seconds=load_seconds,
+        dispatch_within_seconds=None if resident else ceiling_left,
+        estimated_seconds=estimated,
+        retry_after=min(_MAX_RETRY_AFTER, max(_MIN_RETRY_AFTER, estimated / 4)),
+    )
 
 
 def _score_of(scores: tuple[ScoreBreakdown, ...], model: str) -> float:
