@@ -1,0 +1,47 @@
+# The router the TypeScript contract tests run against, scaled down so a swap costs
+# tenths of a second instead of tens. Everything else is the shipped default.
+
+server:
+  host: 127.0.0.1
+  port: 8000 # overridden with --port; the harness picks a free one
+  log_level: warning
+
+scheduler:
+  min_residency_seconds: 0.2
+  max_wait_seconds: 2
+  max_concurrent_requests: 8
+  tick_interval_seconds: 0.02
+  backend_retry_seconds: 0.2
+
+jobs:
+  enabled: true
+  lease_seconds: 5
+  result_ttl_seconds: 30
+  read_ttl_seconds: 10
+  sweep_interval_seconds: 0.1
+  max_jobs: 100
+
+models:
+  - name: chat
+    served_model_name: Qwen/Qwen3-8B
+    backend: mock
+    priority: 1.0
+    mock:
+      load_seconds: 0.2
+      unload_seconds: 0.05
+      tokens_per_second: 200
+      first_token_seconds: 0.0
+      default_max_tokens: 16
+
+  # Slow on purpose: the cancellation tests need a request that is still running when the
+  # caller changes its mind.
+  - name: translate
+    served_model_name: translate
+    backend: mock
+    priority: 1.0
+    mock:
+      load_seconds: 0.2
+      unload_seconds: 0.05
+      tokens_per_second: 4
+      first_token_seconds: 0.1
+      default_max_tokens: 40

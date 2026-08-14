@@ -113,7 +113,7 @@ Everything but the last field is read off scheduler state and is exact. `estimat
 
 Polling doubles as the liveness signal. A held-open socket is what tells `sir` today that a client still wants its answer; a job has no socket, so a job nobody polls for is cancelled once its lease lapses, and abandoned work stops costing GPU time. The default lease is half the starvation ceiling (60s against 120s), which is what stops abandoned work from ever reaching the point where a swap becomes mandatory.
 
-Most services shouldn't hand-roll any of this — see [`clients/python`](clients/python/README.md).
+Most services shouldn't hand-roll any of this. Two clients ship from this repo, with the same surface: [`clients/python`](clients/python/README.md) and [`clients/typescript`](clients/typescript/README.md). Both route between endpoints and forward bodies untouched, exactly as the router does — the drift argued against above doesn't become an SDK's problem either, it just moves from one process into every service's pinned version. What they're actually for is making sure a caller that gives up cancels its job, so an abandoned request stops costing GPU time.
 
 ## Implementation Roadmap
 
@@ -154,12 +154,18 @@ curl -i localhost:8000/v1/chat/completions -H 'content-type: application/json' \
 curl localhost:8000/v1/jobs/<id>    # position, swap, estimate — then the response
 ```
 
-From a service, use the client rather than the endpoint:
+From a service, use a client rather than the endpoint:
 
 ```python
 from sir_client import run_llm
 
 completion = await run_llm("translate", {"messages": [{"role": "user", "content": "hola"}]})
+```
+
+```ts
+import { runLlm } from "sir-client";
+
+const completion = await runLlm("translate", { messages: [{ role: "user", content: "hola" }] });
 ```
 
 Two knobs to reach for first, both under `scheduler:` in the config:

@@ -11,8 +11,11 @@ crash recovery, client cancellation.
 job to poll instead of a held-open connection, carrying the queue position, whether a swap
 is pending, and an advisory estimate. Polling is the liveness signal that a socket used to
 provide, so an abandoned job is cancelled on a lease rather than competing for the GPU
-forever. `clients/python` ships the client half from this repo, so the wire format has one
-home and the contract tests drive the real SDK against the real app in-process.
+forever. `clients/python` and `clients/typescript` ship the client half from this repo, so
+the wire format has one home: Python's contract tests drive the real SDK against the real
+app in-process, and TypeScript's spawn the real router on a free port. Both clients route
+between endpoints and never translate between provider dialects, which is what keeps them
+thin enough to be worth having two of.
 
 The per-model running average of request duration added here is the first measured input
 to Phase 4's cost estimation — until then it only paces polling.

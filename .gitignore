@@ -7,3 +7,5 @@ dist/
 .pytest_cache/
 uv.lock
 config.yaml
+node_modules/
+package-lock.json
