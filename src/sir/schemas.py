@@ -96,6 +96,7 @@ def build_response(
     parts: list[str],
     finish_reason: str,
     response_id: str | None = None,
+    usage: dict[str, int] | None = None,
 ) -> ChatCompletionResponse:
     """Render collected chunks as a completion.
 
@@ -108,10 +109,18 @@ def build_response(
     on every read, and a client that re-fetches a result after a network blip must not be
     handed a second completion id for the one response it asked for.
 
-    A word count standing in for tokenisation, which belongs to the backend. Phase 2 takes
-    these numbers from the real response instead.
+    `usage` is the backend's own token counts when it reported them. Without them, a word
+    count stands in for tokenisation — which properly belongs to the backend, since only it
+    has the tokeniser. The mock has no way to know, so it leaves them out; a real backend
+    always supplies them and its numbers win.
     """
-    prompt_tokens = len(render_prompt(body.messages).split())
+    if usage is None:
+        prompt_tokens = len(render_prompt(body.messages).split())
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": len(parts),
+            "total_tokens": prompt_tokens + len(parts),
+        }
     return ChatCompletionResponse(
         **({"id": response_id} if response_id else {}),
         model=body.model,
@@ -121,11 +130,7 @@ def build_response(
                 finish_reason=finish_reason,
             )
         ],
-        usage=Usage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=len(parts),
-            total_tokens=prompt_tokens + len(parts),
-        ),
+        usage=Usage(**usage),
     )
 
 

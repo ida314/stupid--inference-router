@@ -88,6 +88,11 @@ class Job:
     def finish_reason(self) -> str:
         return self.terminal.finish_reason if isinstance(self.terminal, StreamEnd) else "stop"
 
+    @property
+    def usage(self) -> dict[str, int] | None:
+        """The backend's token counts, if it reported any."""
+        return self.terminal.usage if isinstance(self.terminal, StreamEnd) else None
+
 
 class JobStore:
     """Buffers job results, expires them, and cancels the ones nobody is waiting for."""

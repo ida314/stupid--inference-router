@@ -1,0 +1,65 @@
+# The deployed config: one real model behind the scheduler.
+#
+# Copy to `deploy/config.yaml` (gitignored) and adjust. `sir validate -c <file>` checks it
+# without starting anything.
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  log_level: info
+
+scheduler:
+  # These are an order of magnitude larger than the mock-backed example, and that is not a
+  # style choice: a swap on this hardware costs about five minutes — ~113s loading weights
+  # and ~146s of engine warmup, measured from vLLM's own logs. The 30s/120s pair that suits
+  # a simulated backend would let the starvation ceiling fire twice over before a single
+  # load finished, turning every judgement call into a mandatory swap.
+  min_residency_seconds: 300
+  max_wait_seconds: 900
+
+  age_weight: 1.0
+  depth_weight: 0.5
+  switch_cost_weight: 1.0
+
+  # Matches vLLM's `--max-num-seqs 64`. Left at the default 8, `sir` would be a throughput
+  # regression against talking to vLLM directly — the router would queue requests the
+  # engine was ready to batch. The two numbers should move together.
+  max_concurrent_requests: 64
+
+  tick_interval_seconds: 0.25
+  backend_retry_seconds: 15
+
+jobs:
+  enabled: true
+  # Comfortably under max_wait_seconds, so abandoned work is reclaimed long before it can
+  # reach the starvation ceiling.
+  lease_seconds: 120
+  result_ttl_seconds: 300
+  read_ttl_seconds: 60
+  sweep_interval_seconds: 1
+  max_jobs: 1000
+
+models:
+  - name: chat
+    # The tag every caller on this box already sends, and the one vLLM is started with as
+    # `--served-model-name`. It is the same string end to end: `sir` routes on it and
+    # forwards it unchanged, which is what makes the router a drop-in.
+    served_model_name: nvidia/Qwen3.6-27B-NVFP4
+    backend: vllm
+    priority: 1.0
+    vllm:
+      # The compose service name. vLLM is not published to the host except on loopback.
+      base_url: http://vllm:8000
+
+      # Adopt, don't own. With a single model there is nothing to swap to, so the ability
+      # to stop the container buys nothing and costs the Docker socket — root-equivalent
+      # access, in a service that has no authentication and listens on the LAN.
+      #
+      # Set true and add `container_name` when a second model arrives: that is the point
+      # where stopping one server is what lets the other have the GPU. The compose file
+      # would then also need to stop starting them both.
+      manage_lifecycle: false
+
+      # The measured cold start, which is what the policy charges for a swap.
+      estimated_load_seconds: 310
+      estimated_request_seconds: 8

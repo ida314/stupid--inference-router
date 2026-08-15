@@ -24,6 +24,7 @@ from typing import Any
 
 from sir.backend import Backend, BackendError
 from sir.backends.mock import MockBackend
+from sir.backends.vllm import VllmBackend
 from sir.clock import Clock, RealClock
 from sir.config import AppConfig, ModelConfig
 from sir.policy import decide, estimate_wait
@@ -62,6 +63,8 @@ _RUNNING_POLL_SECONDS = 1.0
 def default_backend_factory(model: ModelConfig, clock: Clock) -> Backend:
     if model.backend == "mock":
         return MockBackend(model.name, model.mock, clock)
+    if model.backend == "vllm":
+        return VllmBackend(model.name, model.vllm, clock)
     raise ValueError(f"unsupported backend kind: {model.backend!r}")
 
 
@@ -236,9 +239,15 @@ class Engine:
         Every exit path except client cancellation puts a terminator on the event queue —
         the API handler is blocked reading it and would otherwise hang forever.
         """
+        # A backend may end its own stream, reporting the real finish reason and token
+        # counts. Most don't, and then the terminator is synthesised below.
+        ending: StreamEnd | None = None
         try:
             async for chunk in backend.stream(queued.request):
                 if queued.cancelled.is_set():
+                    break
+                if isinstance(chunk, StreamEnd):
+                    ending = chunk
                     break
                 await queued.events.put(chunk)
 
@@ -246,7 +255,7 @@ class Engine:
                 queued.state = RequestState.CANCELLED
             else:
                 queued.state = RequestState.DONE
-                await queued.events.put(StreamEnd("stop"))
+                await queued.events.put(ending or StreamEnd("stop"))
                 self._emit(EventKind.COMPLETE, queued.model, detail=queued.id)
         except asyncio.CancelledError:
             queued.state = RequestState.CANCELLED

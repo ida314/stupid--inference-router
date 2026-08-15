@@ -117,7 +117,7 @@ Most services shouldn't hand-roll any of this. Two clients ship from this repo, 
 
 ## Implementation Roadmap
 
-[docs/ROADMAP.md](github.com/ida314/stupid-inference-router)
+[docs/ROADMAP.md](docs/ROADMAP.md)
 
 ### MVP
 
@@ -130,13 +130,21 @@ At that point it's infrastructure rather than a proxy.
 
 ## Running it
 
-Currently phase 1 is finished, against a mock backend.
+Against the mock backend, which needs no GPU and no weights:
 
 ```bash
 uv sync --extra dev
 uv run pytest                                # the invariants: thrash, starvation, crash, cancel
 uv run pytest -s tests/test_policy_sim.py    # decision timelines and the wait/swap trade-off
 uv run sir serve --config config.example.yaml
+```
+
+For a real deployment — `sir` on `:8000` with vLLM behind it — see [deploy/](deploy/):
+
+```bash
+cp deploy/config.example.yaml deploy/config.yaml   # then edit
+uv run sir validate -c deploy/config.yaml
+docker compose -f deploy/compose.yaml up -d
 ```
 
 Then, from anywhere:

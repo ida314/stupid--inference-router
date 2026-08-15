@@ -1,5 +1,6 @@
-"""Backend implementations. Phase 1 ships the mock; vLLM slots in beside it."""
+"""Backend implementations. The mock stands in for a GPU; vLLM is a real one."""
 
 from sir.backends.mock import MockBackend
+from sir.backends.vllm import VllmBackend
 
-__all__ = ["MockBackend"]
+__all__ = ["MockBackend", "VllmBackend"]

@@ -1,0 +1,18 @@
+data: {"id":"chatcmpl-8d3476733fe1552c","object":"chat.completion.chunk","created":1786672315,"model":"nvidia/Qwen3.6-27B-NVFP4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null,"prompt_text":null}
+
+data: {"id":"chatcmpl-8d3476733fe1552c","object":"chat.completion.chunk","created":1786672315,"model":"nvidia/Qwen3.6-27B-NVFP4","choices":[{"index":0,"delta":{"content":"That"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-8d3476733fe1552c","object":"chat.completion.chunk","created":1786672315,"model":"nvidia/Qwen3.6-27B-NVFP4","choices":[{"index":0,"delta":{"content":" is"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-8d3476733fe1552c","object":"chat.completion.chunk","created":1786672315,"model":"nvidia/Qwen3.6-27B-NVFP4","choices":[{"index":0,"delta":{"content":" **"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-8d3476733fe1552c","object":"chat.completion.chunk","created":1786672315,"model":"nvidia/Qwen3.6-27B-NVFP4","choices":[{"index":0,"delta":{"content":"3"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-8d3476733fe1552c","object":"chat.completion.chunk","created":1786672315,"model":"nvidia/Qwen3.6-27B-NVFP4","choices":[{"index":0,"delta":{"content":"**."},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-8d3476733fe1552c","object":"chat.completion.chunk","created":1786672315,"model":"nvidia/Qwen3.6-27B-NVFP4","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-8d3476733fe1552c","object":"chat.completion.chunk","created":1786672315,"model":"nvidia/Qwen3.6-27B-NVFP4","choices":[],"usage":{"prompt_tokens":17,"total_tokens":23,"completion_tokens":6},"system_fingerprint":"vllm-0.23.1rc1.dev701+g00eb7cefa.d20260701-dab47362"}
+
+data: [DONE]
+

@@ -63,6 +63,13 @@ class Chunk:
 class StreamEnd:
     finish_reason: str = "stop"
 
+    # Token counts, when the backend reported them. The mock cannot know these and leaves
+    # it None, in which case the response falls back to counting words. A real backend
+    # tokenised the prompt itself and its numbers are the only true ones — a client
+    # metering spend against `usage` is entitled to the backend's figures, not `sir`'s
+    # approximation of them.
+    usage: dict[str, int] | None = None
+
 
 @dataclass(frozen=True)
 class StreamError:

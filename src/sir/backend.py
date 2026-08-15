@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol, runtime_checkable
 
-from sir.types import Chunk, GenerationRequest
+from sir.types import Chunk, GenerationRequest, StreamEnd
 
 
 class BackendError(RuntimeError):
@@ -45,10 +45,17 @@ class Backend(Protocol):
         """Is this backend able to serve right now?"""
         ...
 
-    def stream(self, request: GenerationRequest) -> AsyncIterator[Chunk]:
+    def stream(self, request: GenerationRequest) -> AsyncIterator[Chunk | StreamEnd]:
         """Generate a response as a sequence of chunks.
 
         Must be cancellable between chunks: the engine cancels this task when a client
         disconnects. Raises `BackendError` if the backend dies mid-generation.
+
+        A backend that knows how its generation ended — the real finish reason, the real
+        token counts — may yield a final `StreamEnd` carrying them, and the engine forwards
+        it untouched. Yielding nothing but chunks is equally valid: the engine then
+        synthesises the terminator itself, which is what the mock relies on. This is the
+        one piece of knowledge that only the backend has, so it is the one thing it is
+        allowed to say about the shape of the response.
         """
         ...

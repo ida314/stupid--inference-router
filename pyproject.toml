@@ -9,6 +9,9 @@ dependencies = [
     "uvicorn>=0.30",
     "pydantic>=2.7",
     "PyYAML>=6.0",
+    # The Triton backend's transport. A runtime dependency rather than a dev one since
+    # Phase 2: talking to a real backend is what the router is for.
+    "httpx>=0.27",
 ]
 
 [project.scripts]

@@ -1,0 +1,119 @@
+# The deployed stack: `sir` on :8000, vLLM behind it.
+#
+# `sir` takes the address vLLM used to hold, because the services on this box already point
+# at localhost:8000 and the router's whole claim is that it is a drop-in for the server it
+# fronts. vLLM moves to the internal network, published on loopback only so it can still be
+# curl'd directly when a question is about the model rather than about the router.
+#
+# Rollback is `docker compose down` then starting the preserved `vllm-qwen36-27b-nvfp4`
+# container, which is left on disk untouched — see ROLLBACK.md.
+
+name: sir
+
+services:
+  # The engine. Flags are the ones recovered from the container that has served this box
+  # since 2026-07-28; ROLLBACK.md records where each came from. Changing them here changes
+  # what the model does, so they are worth reading as a unit rather than tuning piecemeal.
+  vllm:
+    image: eugr/spark-vllm:latest
+    container_name: sir-vllm-qwen36
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    # Loopback only. Nothing off-box should reach the engine except through `sir`, which is
+    # the component that knows about queueing and residency.
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - /home/dylan/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      # NVFP4 on GB10 (sm_121) needs these three. Interlinear/docs/DEPLOY.md:96 records
+      # them as the flags that matter on this box; without them the model does not load.
+      VLLM_NVFP4_GEMM_BACKEND: marlin
+      VLLM_TEST_FORCE_FP8_MARLIN: "1"
+      VLLM_USE_FLASHINFER_MOE_FP4: "0"
+      NCCL_DEBUG: WARN
+    command:
+      - vllm
+      - serve
+      - nvidia/Qwen3.6-27B-NVFP4
+      # The tag clients send. `sir` routes on it and forwards it unchanged, so this string
+      # is shared by the config's served_model_name and by every caller on the box.
+      - --served-model-name
+      - nvidia/Qwen3.6-27B-NVFP4
+      - --quantization
+      - modelopt
+      - --enforce-eager
+      - --kv-cache-dtype
+      - fp8
+      - --tensor-parallel-size
+      - "1"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --gpu-memory-utilization
+      - "0.5"
+      - --max-model-len
+      - "125000"
+      - --max-num-seqs
+      - "64"
+      - --max-num-batched-tokens
+      - "32000"
+      - --limit-mm-per-prompt.image
+      - "8"
+      - --api-server-count
+      - "1"
+      - --renderer-num-workers
+      - "1"
+      - --mm-processor-cache-gb
+      - "4"
+      - --enable-chunked-prefill
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_xml
+      - --reasoning-parser
+      - qwen3
+      # Keeps reasoning out of `content`. Every JSON-parsing caller on this box depends on
+      # it — see BASELINE.md §2, where the captured response has `"reasoning": null`.
+      - --default-chat-template-kwargs
+      - '{"enable_thinking": false}'
+      - --enable-prefix-caching
+      - --trust-remote-code
+    healthcheck:
+      # Roughly five minutes to first health on a cold cache: ~113s of weight loading and
+      # ~146s of engine warmup, measured from this container's own logs. start_period is
+      # what stops that normal startup from being counted as failure.
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 600s
+    stop_grace_period: 120s
+
+  # The router.
+  sir:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: sir:0.1.0
+    container_name: sir
+    restart: unless-stopped
+    # The address the rest of the box already uses. LAN and tailnet reachable, exactly as
+    # vLLM was — `sir` adds no authentication, so this is the same exposure as before and
+    # not a new one.
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config.yaml:/etc/sir/config.yaml:ro
+    depends_on:
+      vllm:
+        # Wait for the model to actually be loaded, not merely for the container to exist.
+        # `sir` would survive starting first — /healthz is deliberately independent of
+        # backend state — but starting in order means the first request after a reboot is
+        # served rather than queued behind a load.
+        condition: service_healthy
+    # Long enough for the lifespan shutdown to drain in-flight requests and stop the
+    # engine. uvicorn is PID 1, so it gets the SIGTERM directly.
+    stop_grace_period: 60s

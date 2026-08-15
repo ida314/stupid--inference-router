@@ -13,7 +13,68 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
-BackendKind = Literal["mock"]
+BackendKind = Literal["mock", "vllm"]
+
+
+class VllmParams(BaseModel):
+    """Where a vLLM server is, and whether `sir` is allowed to start and stop it."""
+
+    model_config = {"extra": "forbid"}
+
+    # The OpenAI-compatible server. vLLM answers to the tag it was given as
+    # `--served-model-name`, which is the same tag clients send, so nothing is renamed
+    # anywhere along this path.
+    base_url: str = "http://vllm:8000"
+    health_path: str = "/health"
+
+    # False: adopt a container somebody else runs. `start()` waits for health, `stop()`
+    # does nothing, and `sir` never needs the Docker socket. Correct while a single model
+    # owns the GPU, because there is nothing to swap to and no reason to give a
+    # network-facing service the power to stop the box's only inference server.
+    #
+    # True: own it. `start()` and `stop()` drive the container, which is what makes a swap
+    # possible — and what a second model requires.
+    manage_lifecycle: bool = False
+
+    # The container to drive. `sir` starts and stops it; it does not create it. The
+    # container is defined in compose, where a thirty-flag vLLM command line can be read
+    # and reviewed, rather than assembled here from a second copy of the same knobs.
+    container_name: str | None = None
+    docker_socket: str = "/var/run/docker.sock"
+
+    # Measured on this hardware: ~113s loading weights, ~146s of engine profiling and
+    # warmup, ~30s of container and process startup. The ceiling is set well above that,
+    # since a cold page cache is the slow case and giving up early on a load that would
+    # have succeeded costs far more than waiting.
+    start_timeout_seconds: float = Field(default=900.0, gt=0)
+    ready_poll_seconds: float = Field(default=2.0, gt=0)
+    # SIGTERM, then Docker's own SIGKILL. This also bounds how long `stop()` waits for the
+    # GPU memory to actually come back.
+    stop_timeout_seconds: float = Field(default=120.0, gt=0)
+
+    # A server that is down should fail fast rather than hang the engine's control loop.
+    connect_timeout_seconds: float = Field(default=10.0, gt=0)
+    # A read gap this long mid-stream means the backend died without closing the socket.
+    # There is deliberately no ceiling on *total* generation time: a long completion at a
+    # low token rate is normal, and the client's own disconnect is the real cancellation
+    # signal. Only silence is evidence of death.
+    stream_stall_seconds: float = Field(default=300.0, gt=0)
+
+    # What the policy charges for making this model resident, before anything has been
+    # measured. The default is the measured cold start above. Phase 4 replaces this with
+    # observations.
+    estimated_load_seconds: float = Field(default=310.0, ge=0)
+    # Opening guess at one request's duration, seeding the engine's running average.
+    estimated_request_seconds: float = Field(default=8.0, gt=0)
+
+    @model_validator(mode="after")
+    def _owning_needs_a_container(self) -> VllmParams:
+        if self.manage_lifecycle and not self.container_name:
+            raise ValueError(
+                "manage_lifecycle requires container_name: `sir` can only start and stop "
+                "a container it can address by name"
+            )
+        return self
 
 
 class MockParams(BaseModel):
@@ -51,6 +112,7 @@ class ModelConfig(BaseModel):
     # volume gets a higher number than a batch summarizer.
     priority: float = Field(default=1.0, gt=0)
     mock: MockParams = Field(default_factory=MockParams)
+    vllm: VllmParams = Field(default_factory=VllmParams)
 
     @property
     def served_names(self) -> list[str]:
@@ -82,6 +144,8 @@ class ModelConfig(BaseModel):
 
         Phase 1 takes the configured value. Phase 3 replaces this with measurements.
         """
+        if self.backend == "vllm":
+            return self.vllm.estimated_load_seconds
         return self.mock.load_seconds
 
     @property
@@ -92,6 +156,8 @@ class ModelConfig(BaseModel):
         completes, measurement takes over. It exists so the first client to ask for a wait
         estimate doesn't get told zero.
         """
+        if self.backend == "vllm":
+            return self.vllm.estimated_request_seconds
         return (
             self.mock.first_token_seconds
             + self.mock.default_max_tokens / self.mock.tokens_per_second

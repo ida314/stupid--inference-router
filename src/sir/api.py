@@ -262,7 +262,7 @@ def _document(engine: Engine, job: Job, jobs: JobsConfig) -> JobDocument:
     error = None
     if job.state is RequestState.DONE:
         response = build_response(
-            job.body, job.texts, job.finish_reason, _completion_id(job.id)
+            job.body, job.texts, job.finish_reason, _completion_id(job.id), job.usage
         )
     elif job.state is RequestState.FAILED and isinstance(job.terminal, StreamError):
         # The inner object, not the envelope: the job document is the envelope here, and
@@ -343,8 +343,10 @@ async def _collect(
     finally:
         watcher.cancel()
 
-    finish_reason = event.finish_reason if isinstance(event, StreamEnd) else "stop"
-    return build_response(body, parts, finish_reason, _completion_id(queued.id))
+    ended = event if isinstance(event, StreamEnd) else None
+    finish_reason = ended.finish_reason if ended else "stop"
+    usage = ended.usage if ended else None
+    return build_response(body, parts, finish_reason, _completion_id(queued.id), usage)
 
 
 async def _sse(
