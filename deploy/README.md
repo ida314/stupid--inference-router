@@ -88,8 +88,17 @@ than the mock config's 30/120 — at those numbers the starvation ceiling would 
 over before a single load finished, and every swap would be mandatory rather than judged.
 
 **`docker kill` does not test crash recovery.** Docker treats it as an explicit operator
-stop and deliberately suppresses `restart: unless-stopped`. To simulate a real crash, kill a
-process *inside* the container instead. What `docker kill` does usefully demonstrate is that
-`sir` survives the engine vanishing: `/healthz` stays green — `api.py:86` makes it
-independent of backend state on purpose — and requests fail with a clean 503 rather than
-hanging.
+stop and deliberately suppresses `restart: unless-stopped` — the container sits in `exited`
+with `RestartCount=0` even on exit 137. To simulate a real crash, kill the engine process
+*inside* the container:
+
+```bash
+pid=$(docker exec sir-vllm-qwen36 bash -c "ps -eo pid,args --no-headers | grep EngineCore | grep -v grep | head -1 | awk '{print \$1}'")
+docker exec sir-vllm-qwen36 kill -9 "$pid"
+```
+
+Verified: the policy fires within ten seconds and the engine reloads unattended. Throughout
+both the killed-container and crashed-process cases, `sir` stays up and keeps answering
+`/healthz` — `api.py:86` makes it independent of backend state on purpose — requests fail
+with a clean 503 rather than hanging, and it resumes serving when the engine returns without
+needing a restart of its own.
