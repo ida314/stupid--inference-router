@@ -1,4 +1,4 @@
-# Stupid Inference Router (`sir`)
+# SIR (Stupid Inference Router)
 
 > A model-aware local inference scheduler for my homelab that presents one API endpoint while dynamically
 > allocating a memory-constrained GPU between multiple LLM workloads.
